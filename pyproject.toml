@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotmic"
+version = "0.1.0"
+description = "Continuous mic buffer with on-demand save"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "sounddevice",
+    "docopt-ng",
+]
+
+[project.scripts]
+hotmic = "hotmic.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

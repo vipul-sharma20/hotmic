@@ -13,6 +13,11 @@ dependencies = [
     "docopt-ng",
 ]
 
+[project.optional-dependencies]
+transcribe = ["mlx-whisper"]
+diarize = ["mlx-whisper", "diarize"]
+all = ["mlx-whisper", "diarize"]
+
 [project.scripts]
 hotmic = "hotmic.cli:main"
 

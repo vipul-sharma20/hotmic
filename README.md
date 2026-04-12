@@ -1,10 +1,11 @@
 # hotmic
 
 CLI tool that keeps a rolling mic buffer and saves the last N minutes of audio
-on demand.
+on demand — with transcription, speaker diarization, and AI-powered summaries.
 
 When something worth keeping happens, hit a hotkey (or CLI commands) and the
-last X minutes get written to a WAV file.
+last X minutes get written to a WAV file. Optionally transcribe it, identify
+speakers, and generate meeting notes automatically.
 
 Start hotmic listen and it keeps the microphone recording into a
 fixed-size rolling buffer. As new audio comes in, the oldest audio gets
@@ -17,6 +18,14 @@ disk until explicitly asked.
 ```bash
 brew install portaudio
 pip install -e .
+```
+
+With optional features:
+
+```bash
+pip install -e '.[transcribe]'   # + mlx-whisper for transcription
+pip install -e '.[diarize]'      # + transcription + speaker diarization
+pip install -e '.[all]'          # everything
 ```
 
 ## Usage
@@ -35,11 +44,61 @@ hotmic status           # buffer stats (prints in listen terminal)
 
 Interactive commands also work directly in the `listen` terminal: `save [min]`, `pause`, `resume`, `status`, `q`.
 
+### System audio capture (meeting recording)
+
+Capture both your mic and system audio (Zoom/Meet/Teams) without touching your audio routing:
+
+```bash
+hotmic listen --buffer 60 --system-audio --diarize --summarize
+```
+
+Uses [audiotee](https://github.com/makeusabrew/audiotee) to passively tap system audio via macOS Core Audio taps (macOS 14.2+). Your meeting runs normally — no virtual audio drivers, no aggregate devices, no interference.
+
+First run will prompt for "System Audio Recording" permission in System Settings.
+
+### Transcription & summarization
+
+```bash
+# Auto-transcribe every save (writes .txt + .srt alongside .wav)
+hotmic listen --buffer 30 --transcribe
+
+# Auto-transcribe with speaker diarization
+hotmic listen --buffer 30 --diarize
+
+# Auto-transcribe + diarize + generate meeting notes
+hotmic listen --buffer 30 --diarize --summarize
+
+# Transcribe an existing file
+hotmic transcribe recording.wav
+hotmic transcribe recording.wav --diarize
+
+# Summarize an existing transcript
+hotmic summarize recording.txt
+```
+
+Transcription uses [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized). Diarization uses [diarize](https://github.com/FoxNoseTech/diarize) (no API keys needed). Summarization uses `claude -p`.
+
+### Bookmarks
+
+Drop timestamp markers during recording, then save specific segments:
+
+```bash
+# From another terminal (or via hotkey):
+hotmic mark meeting-start    # drop a named bookmark
+hotmic mark meeting-end      # drop another
+hotmic marks                 # list all marks (in listen terminal)
+hotmic save --since-mark     # save from last mark to now
+hotmic save --between-marks  # save between last two marks
+```
+
+Interactive commands: `mark [label]`, `marks`, `save --since-mark`, `save --between-marks`.
+
 ### [skhd][skhd] integration
 
 ```bash
 cmd + shift - s : hotmic save 5
 cmd + shift - a : hotmic save
+cmd + shift - m : hotmic mark
 cmd + shift - p : hotmic pause
 cmd + shift - r : hotmic resume
 ```
@@ -50,6 +109,10 @@ cmd + shift - r : hotmic resume
 -b --buffer=<min>   Buffer size in minutes [default: 5]
 -o --output=<dir>   Output directory [default: ./recordings]
 -r --rate=<hz>      Sample rate in Hz [default: 44100]
+--system-audio      Capture system audio via audiotee (macOS 14.2+)
+--transcribe        Transcribe saved audio using mlx-whisper
+--diarize           Identify speakers (requires diarize package)
+--summarize         Generate meeting notes (requires claude CLI)
 ```
 
 Use `--rate 16000` if you only care about voice — cuts memory ~2.75x.

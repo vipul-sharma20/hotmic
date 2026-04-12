@@ -13,7 +13,7 @@ _INIT_SECONDS = 120  # initial alloc covers ~2 minutes
 
 
 class RingBuffer:
-    __slots__ = ("_buf", "_pos", "_full", "_capacity")
+    __slots__ = ("_buf", "_pos", "_full", "_capacity", "_total_writes")
 
     def __init__(self, capacity: int, sample_rate: int):
         init = min(_INIT_SECONDS * sample_rate, capacity)
@@ -21,6 +21,7 @@ class RingBuffer:
         self._capacity = capacity
         self._pos = 0
         self._full = False
+        self._total_writes = 0
 
     def write(self, data: np.ndarray):
         n = len(data)
@@ -28,6 +29,7 @@ class RingBuffer:
             self._write_ring(data, n)
         else:
             self._write_growing(data, n)
+        self._total_writes += n
 
     def _write_growing(self, data: np.ndarray, n: int):
         """Linear fill phase. Grows buffer by doubling when needed."""
@@ -83,6 +85,43 @@ class RingBuffer:
         return self._capacity if self._full else self._pos
 
     @property
+    def pos(self) -> int:
+        """Current write cursor position in the buffer."""
+        return self._pos
+
+    @property
+    def total_writes(self) -> int:
+        """Monotonic count of all samples written since creation."""
+        return self._total_writes
+
+    @property
     def allocated_bytes(self) -> int:
         """Current memory usage of the backing array."""
         return len(self._buf) * self._buf.itemsize
+
+    def read_range(self, start_total: int, end_total: int) -> np.ndarray:
+        """Read samples between two total_writes snapshots.
+
+        Raises ValueError if the requested range has been overwritten.
+        """
+        now = self._total_writes
+        if end_total > now:
+            end_total = now
+        n = end_total - start_total
+        if n <= 0:
+            return np.array([], dtype=np.int16)
+        # Check both endpoints are still in the buffer
+        oldest_available = now - self.available
+        if start_total < oldest_available:
+            raise ValueError(
+                f"Mark audio overwritten: needed sample {start_total}, "
+                f"oldest available is {oldest_available}"
+            )
+        # Convert totals to buffer positions
+        start_pos = start_total % self._capacity
+        end_pos = end_total % self._capacity
+        if not self._full:
+            return self._buf[start_pos:end_pos].copy()
+        if start_pos < end_pos:
+            return self._buf[start_pos:end_pos].copy()
+        return np.concatenate([self._buf[start_pos:self._capacity], self._buf[:end_pos]])

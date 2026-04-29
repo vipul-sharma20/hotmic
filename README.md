@@ -13,6 +13,11 @@ discarded, the buffer always holds the most recent N minutes. At any point, you
 can save the last X minutes (where X <= N) to a WAV file. Nothing is written to
 disk until explicitly asked.
 
+> [!NOTE]
+> This project was built and tested for macOS. It most likely only works on
+> macOS, especially system audio capture, which depends on macOS Core Audio
+> taps.
+
 ## Install (MacOS)
 
 ```bash

@@ -23,7 +23,9 @@ src/hotmic/
   write cursor. Starts at ~2 min worth, doubles up to capacity. O(1) writes in
   the audio callback, O(n) reads only on save. Once full, zero allocations.
   Monotonic `_total_writes` counter enables bookmark validity detection.
-  `read_range(start_total, end_total)` extracts audio between two bookmarked positions.
+  `read_range(start_total, end_total)` extracts mixed mono audio between two
+  bookmarked positions. `read_last_tracks`/`read_range_tracks` return aligned
+  mic and system-audio tracks for split-source output.
 - **CLI** (`cli.py`): Subcommand-based. `listen` starts the daemon (docopt,
   sounddevice stream, FIFO + stdin readers, command loop). `save`/`pause`/
   `resume`/`status`/`mark`/`marks` send commands to the running daemon via a
@@ -41,6 +43,12 @@ src/hotmic/
 - **Lazy growth**: Starts at ~10 MB (2 min at 44100 Hz), doubles as buffer fills. No wasted RAM if you quit early. Once at capacity, never allocates again.
 - **Single numpy array**: Avoids millions of small array allocations that a deque-of-chunks approach would create.
 - **Configurable sample rate**: Default 44100 Hz. Use `--rate 16000` for voice-only (cuts memory ~2.75x).
+- **Split source saves**: With `--system-audio`, each save keeps compatible
+  mixed mono output in `audio.wav` and also writes `mic.wav`, `system.wav`, and
+  `audio_stereo.wav` with mic on the left channel and system audio on the right.
+- **Meeting names**: `hotmic save --name "Meeting Name"` prefixes the
+  timestamped save directory with a sanitized name and writes the original name to
+  `metadata.json`.
 - **Monotonic write counter for bookmarks**: `_pos` wraps around; `_total_writes` only increments. Bookmark validity is checked against current `_total_writes` to detect overwritten audio.
 - **Non-daemon background threads**: Transcription/summarization threads are non-daemon and joined on exit, so they complete even if the user quits right after saving.
 - **Optional deps with lazy imports**: Base install is numpy+sounddevice+docopt. mlx-whisper and diarize are optional.

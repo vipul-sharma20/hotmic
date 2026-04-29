@@ -2,7 +2,7 @@
 
 Usage:
     hotmic listen [--buffer=<min>] [--output=<dir>] [--rate=<hz>] [--system-audio] [--transcribe] [--diarize] [--summarize]
-    hotmic save [<minutes>] [--since-mark] [--between-marks]
+    hotmic save [<minutes>] [--since-mark] [--between-marks] [--name=<name>]
     hotmic pause
     hotmic resume
     hotmic status
@@ -18,6 +18,7 @@ Options:
     -o --output=<dir>   Output directory [default: ./recordings]
     -r --rate=<hz>      Sample rate in Hz [default: 44100]
     --system-audio      Capture system audio (Zoom/Meet/Teams) via audiotee
+    --name=<name>       Meeting name to prefix the save directory
     --transcribe        Transcribe saved audio using mlx-whisper
     --diarize           Identify speakers (requires diarize package)
     --summarize         Generate meeting notes after transcription (implies --transcribe)
@@ -29,6 +30,8 @@ import atexit
 import json
 import os
 import queue
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -85,48 +88,108 @@ def _fifo_reader(q: queue.Queue):
 
 
 def _write_wav(audio, sample_rate: int, filepath: Path):
+    channels = 1 if audio.ndim == 1 else audio.shape[1]
     with wave.open(str(filepath), "wb") as wf:
-        wf.setnchannels(1)
+        wf.setnchannels(channels)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(audio.tobytes())
 
 
-def _create_save_dir(output_dir: Path) -> Path:
+def _slugify_name(name: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", name.strip()).strip("_").lower()
+    return slug[:80]
+
+
+def _create_save_dir(output_dir: Path, meeting_name: str | None = None) -> Path:
     """Create a timestamped directory for this save's outputs."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = output_dir / f"hotmic_{timestamp}"
+    slug = _slugify_name(meeting_name) if meeting_name else ""
+    dirname = f"{slug}_hotmic_{timestamp}" if slug else f"hotmic_{timestamp}"
+    save_dir = output_dir / dirname
     save_dir.mkdir(parents=True, exist_ok=True)
     return save_dir
 
 
-def _save(ring: RingBuffer, seconds: int, sample_rate: int, output_dir: Path):
+def _write_recording_files(
+    save_dir: Path,
+    primary: np.ndarray,
+    aux: np.ndarray,
+    sample_rate: int,
+    split_sources: bool,
+) -> Path:
+    mixed = RingBuffer.mix_tracks(primary, aux)
+    filepath = save_dir / "audio.wav"
+    _write_wav(mixed, sample_rate, filepath)
+
+    if split_sources:
+        _write_wav(primary, sample_rate, save_dir / "mic.wav")
+        _write_wav(aux, sample_rate, save_dir / "system.wav")
+        stereo = np.column_stack((primary, aux)).astype(np.int16, copy=False)
+        _write_wav(stereo, sample_rate, save_dir / "audio_stereo.wav")
+
+    return filepath
+
+
+def _write_save_metadata(
+    save_dir: Path,
+    meeting_name: str | None,
+    duration_seconds: float,
+    sample_rate: int,
+    split_sources: bool,
+):
+    files = ["audio.wav"]
+    if split_sources:
+        files.extend(["mic.wav", "system.wav", "audio_stereo.wav"])
+    metadata = {
+        "meeting_name": meeting_name or "",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "duration_seconds": duration_seconds,
+        "sample_rate": sample_rate,
+        "files": files,
+    }
+    (save_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+
+def _save(
+    ring: RingBuffer,
+    seconds: int,
+    sample_rate: int,
+    output_dir: Path,
+    split_sources: bool = False,
+    meeting_name: str | None = None,
+):
     samples = seconds * sample_rate
-    audio = ring.read_last(samples)
-    if len(audio) == 0:
+    primary, aux = ring.read_last_tracks(samples)
+    if len(primary) == 0:
         print("Buffer empty, nothing to save.")
         return None
-    save_dir = _create_save_dir(output_dir)
-    filepath = save_dir / "audio.wav"
-    _write_wav(audio, sample_rate, filepath)
-    print(f"Saved {len(audio) / sample_rate:.1f}s -> {save_dir.name}/")
+    save_dir = _create_save_dir(output_dir, meeting_name)
+    filepath = _write_recording_files(save_dir, primary, aux, sample_rate, split_sources)
+    _write_save_metadata(save_dir, meeting_name, len(primary) / sample_rate,
+                         sample_rate, split_sources)
+    extras = " (+ mic.wav, system.wav, audio_stereo.wav)" if split_sources else ""
+    print(f"Saved {len(primary) / sample_rate:.1f}s -> {save_dir.name}/{extras}")
     return filepath
 
 
 def _save_range(ring: RingBuffer, start_total: int, end_total: int,
-                sample_rate: int, output_dir: Path):
+                sample_rate: int, output_dir: Path, split_sources: bool = False,
+                meeting_name: str | None = None):
     try:
-        audio = ring.read_range(start_total, end_total)
+        primary, aux = ring.read_range_tracks(start_total, end_total)
     except ValueError as e:
         print(f"Cannot save: {e}")
         return None
-    if len(audio) == 0:
+    if len(primary) == 0:
         print("No audio in range.")
         return None
-    save_dir = _create_save_dir(output_dir)
-    filepath = save_dir / "audio.wav"
-    _write_wav(audio, sample_rate, filepath)
-    print(f"Saved {len(audio) / sample_rate:.1f}s -> {save_dir.name}/")
+    save_dir = _create_save_dir(output_dir, meeting_name)
+    filepath = _write_recording_files(save_dir, primary, aux, sample_rate, split_sources)
+    _write_save_metadata(save_dir, meeting_name, len(primary) / sample_rate,
+                         sample_rate, split_sources)
+    extras = " (+ mic.wav, system.wav, audio_stereo.wav)" if split_sources else ""
+    print(f"Saved {len(primary) / sample_rate:.1f}s -> {save_dir.name}/{extras}")
     return filepath
 
 
@@ -178,6 +241,40 @@ def _append_mark(output_dir: Path, marks: list[dict], total_writes: int, wall: f
 
 # --- audiotee ---
 
+def _parse_save_command(cmd: str) -> tuple[set[str], float | None, str | None]:
+    try:
+        parts = shlex.split(cmd)
+    except ValueError as e:
+        raise ValueError(f"Could not parse save command: {e}") from e
+
+    flags: set[str] = set()
+    minutes: float | None = None
+    meeting_name: str | None = None
+    i = 1
+    while i < len(parts):
+        token = parts[i]
+        lower = token.lower()
+        if lower in ("--between-marks", "--since-mark"):
+            flags.add(lower)
+        elif lower.startswith("--name="):
+            meeting_name = token.split("=", 1)[1].strip()
+        elif lower == "--name":
+            i += 1
+            if i >= len(parts):
+                raise ValueError("--name needs a meeting name.")
+            meeting_name = parts[i].strip()
+        elif minutes is None:
+            try:
+                minutes = float(token)
+            except ValueError as e:
+                raise ValueError(f"Invalid minutes value: {token}") from e
+        else:
+            raise ValueError(f"Unexpected save argument: {token}")
+        i += 1
+
+    return flags, minutes, meeting_name or None
+
+
 def _find_audiotee() -> Path:
     """Find the audiotee binary."""
     if _AUDIOTEE_BIN.exists():
@@ -192,7 +289,7 @@ def _find_audiotee() -> Path:
 
 
 def _audiotee_reader(ring: RingBuffer, sample_rate: int, proc: subprocess.Popen):
-    """Read PCM int16 chunks from audiotee stdout and write to ring buffer."""
+    """Read PCM int16 chunks from audiotee stdout and write to aux ring buffer."""
     chunk_samples = 1024
     chunk_bytes = chunk_samples * 2  # int16 = 2 bytes per sample
     try:
@@ -201,7 +298,7 @@ def _audiotee_reader(ring: RingBuffer, sample_rate: int, proc: subprocess.Popen)
             if not data:
                 break
             samples = np.frombuffer(data, dtype=np.int16)
-            ring.write(samples)
+            ring.write_aux(samples)
     except Exception as e:
         print(f"\n[system-audio] {e}", file=sys.stderr)
 
@@ -262,7 +359,6 @@ def _listen(args):
         samplerate=sample_rate,
         channels=1,
         dtype="int16",
-        blocksize=1024,
         callback=callback,
     )
 
@@ -273,7 +369,7 @@ def _listen(args):
     print(f"Listening | buffer: {buffer_min} min | rate: {sample_rate} Hz | output: {output_dir}")
     if do_system_audio:
         print("  System audio: on (via audiotee)")
-    print("Commands: save [min], mark [label], marks, pause, resume, status, q")
+    print('Commands: save [min] [--name "Meeting"], mark [label], marks, pause, resume, status, q')
     if do_transcribe:
         flags = f"Auto-transcribe: on | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
         print(f"  {flags}")
@@ -293,16 +389,18 @@ def _listen(args):
             cmd = q.get()
             if cmd is None:
                 break
-            cmd = cmd.lower()
+            command_name = cmd.split(maxsplit=1)[0].lower() if cmd else ""
 
             if not cmd:
                 continue
-            elif cmd in ("q", "quit", "exit"):
+            elif command_name in ("q", "quit", "exit"):
                 break
-            elif cmd.startswith("save"):
-                parts = cmd.split()
-                flags = [p for p in parts[1:] if p.startswith("--")]
-                nums = [p for p in parts[1:] if not p.startswith("--")]
+            elif command_name == "save":
+                try:
+                    flags, minutes_arg, meeting_name = _parse_save_command(cmd)
+                except ValueError as e:
+                    print(f"Cannot save: {e}")
+                    continue
 
                 if "--between-marks" in flags:
                     if len(marks) < 2:
@@ -311,7 +409,8 @@ def _listen(args):
                         start_total = marks[-2]["total_writes"]
                         end_total = marks[-1]["total_writes"]
                         filepath = _save_range(ring, start_total, end_total,
-                                               sample_rate, output_dir)
+                                               sample_rate, output_dir, do_system_audio,
+                                               meeting_name)
                         _launch_post_save(filepath)
                 elif "--since-mark" in flags:
                     if not marks:
@@ -320,16 +419,18 @@ def _listen(args):
                         start_total = marks[-1]["total_writes"]
                         end_total = ring.total_writes
                         filepath = _save_range(ring, start_total, end_total,
-                                               sample_rate, output_dir)
+                                               sample_rate, output_dir, do_system_audio,
+                                               meeting_name)
                         _launch_post_save(filepath)
                 else:
-                    minutes = float(nums[0]) if nums else buffer_min
+                    minutes = minutes_arg if minutes_arg is not None else buffer_min
                     if minutes > buffer_min:
                         print(f"Max buffer is {buffer_min} min, clamping.")
                         minutes = buffer_min
-                    filepath = _save(ring, int(minutes * 60), sample_rate, output_dir)
+                    filepath = _save(ring, int(minutes * 60), sample_rate,
+                                     output_dir, do_system_audio, meeting_name)
                     _launch_post_save(filepath)
-            elif cmd.startswith("mark"):
+            elif command_name == "mark":
                 parts = cmd.split(maxsplit=1)
                 label = parts[1] if len(parts) > 1 else ""
                 tw = ring.total_writes
@@ -339,7 +440,7 @@ def _listen(args):
                 idx = len(marks) - 1
                 name = f" '{label}'" if label else ""
                 print(f"Mark #{idx}{name} at {ts}")
-            elif cmd == "marks":
+            elif command_name == "marks":
                 if not marks:
                     print("No marks.")
                 else:
@@ -350,19 +451,19 @@ def _listen(args):
                         valid = "ok" if m["total_writes"] >= oldest else "overwritten"
                         name = f" '{m['label']}'" if m["label"] else ""
                         print(f"  #{i}{name} at {ts} [{valid}]")
-            elif cmd == "pause":
+            elif command_name == "pause":
                 if stream.active:
                     stream.stop()
                     print("Paused.")
                 else:
                     print("Already paused.")
-            elif cmd == "resume":
+            elif command_name == "resume":
                 if not stream.active:
                     stream.start()
                     print("Resumed.")
                 else:
                     print("Already listening.")
-            elif cmd == "status":
+            elif command_name == "status":
                 filled_s = ring.available / sample_rate
                 cap_s = buffer_min * 60
                 pct = filled_s / cap_s * 100
@@ -403,6 +504,8 @@ def main():
             parts.append("--since-mark")
         if args["--between-marks"]:
             parts.append("--between-marks")
+        if args["--name"]:
+            parts.extend(["--name", shlex.quote(args["--name"])])
         _send_command(f"save {' '.join(parts)}".strip())
     elif args["pause"]:
         _send_command("pause")

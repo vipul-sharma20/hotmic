@@ -41,13 +41,14 @@ hotmic listen --buffer 30
 
 # In another terminal (or via hotkey):
 hotmic save 5           # save last 5 minutes
+hotmic save 5 --name "Weekly Review"
 hotmic save             # save entire buffer
 hotmic pause            # mute mic
 hotmic resume           # unmute
 hotmic status           # buffer stats (prints in listen terminal)
 ```
 
-Interactive commands also work directly in the `listen` terminal: `save [min]`, `pause`, `resume`, `status`, `q`.
+Interactive commands also work directly in the `listen` terminal: `save [min] --name "Meeting Name"`, `pause`, `resume`, `status`, `q`.
 
 ### System audio capture (meeting recording)
 
@@ -60,6 +61,14 @@ hotmic listen --buffer 60 --system-audio --diarize --summarize
 Uses [audiotee](https://github.com/makeusabrew/audiotee) to passively tap system audio via macOS Core Audio taps (macOS 14.2+). Your meeting runs normally — no virtual audio drivers, no aggregate devices, no interference.
 
 First run will prompt for "System Audio Recording" permission in System Settings.
+
+When system audio capture is enabled, each save writes:
+
+- `audio.wav` — mixed mono mic + system audio
+- `mic.wav` — microphone only
+- `system.wav` — system audio only
+- `audio_stereo.wav` — stereo split, mic on left and system audio on right
+- `metadata.json` — meeting name, save time, duration, sample rate, and file list
 
 ### Transcription & summarization
 
@@ -75,6 +84,8 @@ hotmic listen --buffer 30 --diarize --summarize
 
 # Transcribe an existing file
 hotmic transcribe recording.wav
+hotmic transcribe hotmic_20260429_103000/mic.wav
+hotmic transcribe hotmic_20260429_103000/system.wav
 hotmic transcribe recording.wav --diarize
 
 # Summarize an existing transcript
@@ -92,11 +103,11 @@ Drop timestamp markers during recording, then save specific segments:
 hotmic mark meeting-start    # drop a named bookmark
 hotmic mark meeting-end      # drop another
 hotmic marks                 # list all marks (in listen terminal)
-hotmic save --since-mark     # save from last mark to now
-hotmic save --between-marks  # save between last two marks
+hotmic save --since-mark --name "Customer Call"     # save from last mark to now
+hotmic save --between-marks --name "Design Review"  # save between last two marks
 ```
 
-Interactive commands: `mark [label]`, `marks`, `save --since-mark`, `save --between-marks`.
+Interactive commands: `mark [label]`, `marks`, `save [min] --name "Meeting Name"`, `save --since-mark`, `save --between-marks`.
 
 ### [skhd][skhd] integration
 
@@ -115,6 +126,7 @@ cmd + shift - r : hotmic resume
 -o --output=<dir>   Output directory [default: ./recordings]
 -r --rate=<hz>      Sample rate in Hz [default: 44100]
 --system-audio      Capture system audio via audiotee (macOS 14.2+)
+--name=<name>       Meeting name to prefix the save directory
 --transcribe        Transcribe saved audio using mlx-whisper
 --diarize           Identify speakers (requires diarize package)
 --summarize         Generate meeting notes (requires claude CLI)

@@ -43,12 +43,13 @@ hotmic listen --buffer 30
 hotmic save 5           # save last 5 minutes
 hotmic save 5 --name "Weekly Review"
 hotmic save             # save entire buffer
+hotmic buffer 120       # increase live buffer to 120 minutes
 hotmic pause            # mute mic
 hotmic resume           # unmute
 hotmic status           # buffer stats (prints in listen terminal)
 ```
 
-Interactive commands also work directly in the `listen` terminal: `save [min] --name "Meeting Name"`, `pause`, `resume`, `status`, `q`.
+Interactive commands also work directly in the `listen` terminal: `save [min] --name "Meeting Name"`, `buffer <min>`, `pause`, `resume`, `status`, `q`.
 
 ### System audio capture (meeting recording)
 
@@ -108,6 +109,16 @@ hotmic save --between-marks --name "Design Review"  # save between last two mark
 ```
 
 Interactive commands: `mark [label]`, `marks`, `save [min] --name "Meeting Name"`, `save --since-mark`, `save --between-marks`.
+
+### Growing the live buffer
+
+Increase retention at runtime without restarting `listen`:
+
+```bash
+hotmic buffer 120
+```
+
+This preserves audio that is still in the current rolling buffer and allows future audio to fill the larger capacity. Audio already overwritten before the resize cannot be recovered. Shrinking is not supported while recording.
 
 ### [skhd][skhd] integration
 

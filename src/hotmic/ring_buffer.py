@@ -55,6 +55,45 @@ class RingBuffer:
                 self._aux_full = False
             self._aux_write(data, n)
 
+    def grow_capacity(self, capacity: int) -> bool:
+        """Increase maximum retained samples, preserving current audio.
+
+        Returns True when capacity changed. Shrinking is intentionally not
+        supported because it would discard audio at runtime.
+        """
+        with self._lock:
+            if capacity <= self._capacity:
+                return False
+
+            if not self._full and (self._aux is None or not self._aux_full):
+                self._capacity = capacity
+                return True
+
+            avail = self.available
+            old_start = 0 if not self._full else self._pos
+            if self._full:
+                primary = self._read_region(self._buf, old_start, avail)
+            else:
+                primary = self._buf[:avail].copy()
+
+            new_size = min(max(len(self._buf), avail), capacity)
+            new_buf = np.zeros(new_size, dtype=np.int16)
+            new_buf[:avail] = primary
+            self._buf = new_buf
+            self._capacity = capacity
+            self._pos = avail
+            self._full = self._pos == self._capacity
+
+            if self._aux is not None:
+                aux = self._read_aux_track(old_start, avail)
+                new_aux = np.zeros(new_size, dtype=np.int16)
+                new_aux[:avail] = aux
+                self._aux = new_aux
+                self._aux_pos = avail
+                self._aux_full = self._aux_pos == self._capacity
+
+            return True
+
     def _aux_write(self, data: np.ndarray, n: int):
         if self._aux_full:
             self._aux_write_ring(data, n)
@@ -196,6 +235,11 @@ class RingBuffer:
     def total_writes(self) -> int:
         """Monotonic count of all samples written since creation."""
         return self._total_writes
+
+    @property
+    def capacity(self) -> int:
+        """Maximum samples retained by the ring buffer."""
+        return self._capacity
 
     @property
     def allocated_bytes(self) -> int:

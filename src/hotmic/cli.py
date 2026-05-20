@@ -5,6 +5,7 @@ Usage:
     hotmic save [<minutes>] [--since-mark] [--between-marks] [--name=<name>]
     hotmic pause
     hotmic resume
+    hotmic buffer <minutes>
     hotmic status
     hotmic mark [<label>]
     hotmic marks
@@ -275,6 +276,26 @@ def _parse_save_command(cmd: str) -> tuple[set[str], float | None, str | None]:
     return flags, minutes, meeting_name or None
 
 
+def _parse_buffer_command(cmd: str) -> float:
+    try:
+        parts = shlex.split(cmd)
+    except ValueError as e:
+        raise ValueError(f"Could not parse buffer command: {e}") from e
+
+    if len(parts) != 2:
+        raise ValueError("Usage: buffer <minutes>")
+
+    try:
+        minutes = float(parts[1])
+    except ValueError as e:
+        raise ValueError(f"Invalid minutes value: {parts[1]}") from e
+
+    if minutes <= 0:
+        raise ValueError("Buffer minutes must be greater than 0.")
+
+    return minutes
+
+
 def _find_audiotee() -> Path:
     """Find the audiotee binary."""
     if _AUDIOTEE_BIN.exists():
@@ -369,7 +390,7 @@ def _listen(args):
     print(f"Listening | buffer: {buffer_min} min | rate: {sample_rate} Hz | output: {output_dir}")
     if do_system_audio:
         print("  System audio: on (via audiotee)")
-    print('Commands: save [min] [--name "Meeting"], mark [label], marks, pause, resume, status, q')
+    print('Commands: save [min] [--name "Meeting"], buffer <min>, mark [label], marks, pause, resume, status, q')
     if do_transcribe:
         flags = f"Auto-transcribe: on | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
         print(f"  {flags}")
@@ -430,6 +451,33 @@ def _listen(args):
                     filepath = _save(ring, int(minutes * 60), sample_rate,
                                      output_dir, do_system_audio, meeting_name)
                     _launch_post_save(filepath)
+            elif command_name in ("buffer", "resize"):
+                try:
+                    requested_min = _parse_buffer_command(cmd)
+                except ValueError as e:
+                    print(f"Cannot resize buffer: {e}")
+                    continue
+
+                new_capacity = int(requested_min * 60 * sample_rate)
+                old_buffer_min = ring.capacity / sample_rate / 60
+                if not ring.grow_capacity(new_capacity):
+                    if new_capacity == ring.capacity:
+                        print(f"Buffer is already {old_buffer_min:g} min.")
+                    else:
+                        print(
+                            f"Current buffer is {old_buffer_min:g} min; "
+                            "shrinking is not supported."
+                        )
+                    continue
+
+                buffer_min = requested_min
+                filled_s = ring.available / sample_rate
+                alloc_mb = ring.allocated_bytes / 1_048_576
+                max_mb = ring.capacity * 2 / 1_048_576
+                print(
+                    f"Buffer increased: {old_buffer_min:g} -> {buffer_min:g} min "
+                    f"| retained: {filled_s:.1f}s | mem: {alloc_mb:.0f}/{max_mb:.0f} MB"
+                )
             elif command_name == "mark":
                 parts = cmd.split(maxsplit=1)
                 label = parts[1] if len(parts) > 1 else ""
@@ -465,10 +513,10 @@ def _listen(args):
                     print("Already listening.")
             elif command_name == "status":
                 filled_s = ring.available / sample_rate
-                cap_s = buffer_min * 60
+                cap_s = ring.capacity / sample_rate
                 pct = filled_s / cap_s * 100
                 alloc_mb = ring.allocated_bytes / 1_048_576
-                max_mb = ring._capacity * 2 / 1_048_576
+                max_mb = ring.capacity * 2 / 1_048_576
                 state = "listening" if stream.active else "paused"
                 print(f"Buffer: {filled_s:.1f}s / {cap_s:.0f}s ({pct:.0f}%) | mem: {alloc_mb:.0f}/{max_mb:.0f} MB | {state}")
                 if marks:
@@ -511,6 +559,8 @@ def main():
         _send_command("pause")
     elif args["resume"]:
         _send_command("resume")
+    elif args["buffer"]:
+        _send_command(f"buffer {args['<minutes>']}")
     elif args["status"]:
         _send_command("status")
     elif args["mark"]:

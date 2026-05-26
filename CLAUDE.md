@@ -28,7 +28,7 @@ src/hotmic/
   mic and system-audio tracks for split-source output.
 - **CLI** (`cli.py`): Subcommand-based. `listen` starts the daemon (docopt,
   sounddevice stream, FIFO + stdin readers, command loop). `save`/`pause`/
-  `resume`/`status`/`mark`/`marks` send commands to the running daemon via a
+  `resume`/`buffer`/`status`/`mark`/`marks` send commands to the running daemon via a
   named pipe (`/tmp/hotmic.pipe`). Transcription and summarization run on
   non-daemon background threads that complete even if the user quits.
 - **Transcribe** (`transcribe.py`): mlx-whisper for transcription (Apple Silicon
@@ -41,6 +41,10 @@ src/hotmic/
 
 - **int16 capture**: sounddevice captures directly as int16. No float32→int16 conversion. Halves memory vs float32.
 - **Lazy growth**: Starts at ~10 MB (2 min at 44100 Hz), doubles as buffer fills. No wasted RAM if you quit early. Once at capacity, never allocates again.
+- **Runtime capacity growth**: `hotmic buffer <minutes>` increases the live
+  retention window without restarting. Existing retained audio is copied into
+  the larger buffer; already-overwritten audio cannot be recovered. Runtime
+  shrinking is intentionally unsupported.
 - **Single numpy array**: Avoids millions of small array allocations that a deque-of-chunks approach would create.
 - **Configurable sample rate**: Default 44100 Hz. Use `--rate 16000` for voice-only (cuts memory ~2.75x).
 - **Split source saves**: With `--system-audio`, each save keeps compatible
@@ -93,6 +97,7 @@ hotmic save --since-mark   # save from last mark to now
 hotmic save --between-marks # save between last two marks
 hotmic mark meeting-start  # drop a bookmark
 hotmic marks               # list bookmarks
+hotmic buffer 120          # increase live buffer to 120 minutes
 hotmic pause               # stop mic
 hotmic resume              # restart mic
 hotmic status              # print buffer info (in listen terminal)

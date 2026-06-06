@@ -197,7 +197,7 @@ def _save_range(ring: RingBuffer, start_total: int, end_total: int,
 def _transcribe_background(wav_path: Path, do_diarize: bool, do_summarize: bool):
     try:
         from .transcribe import transcribe_wav
-        print(f"Transcribing {wav_path.parent.name}/audio.wav{'  (+ diarization)' if do_diarize else ''}...")
+        print(f"Transcribing {wav_path.parent.name}/{wav_path.name}{'  (+ diarization)' if do_diarize else ''}...")
         txt_path, srt_path = transcribe_wav(wav_path, diarize=do_diarize)
         print(f"Transcribed -> {wav_path.parent.name}/{txt_path.name}, {srt_path.name}")
         if do_summarize:
@@ -296,6 +296,40 @@ def _parse_buffer_command(cmd: str) -> float:
     return minutes
 
 
+def _parse_transcribe_command(cmd: str) -> tuple[Path, bool]:
+    try:
+        parts = shlex.split(cmd)
+    except ValueError as e:
+        raise ValueError(f"Could not parse transcribe command: {e}") from e
+
+    file_arg: str | None = None
+    do_diarize = False
+    for token in parts[1:]:
+        if token.lower() == "--diarize":
+            do_diarize = True
+        elif file_arg is None:
+            file_arg = token
+        else:
+            raise ValueError(f"Unexpected transcribe argument: {token}")
+
+    if file_arg is None:
+        raise ValueError("Usage: transcribe <file> [--diarize]")
+
+    return Path(file_arg).expanduser(), do_diarize
+
+
+def _parse_summarize_command(cmd: str) -> Path:
+    try:
+        parts = shlex.split(cmd)
+    except ValueError as e:
+        raise ValueError(f"Could not parse summarize command: {e}") from e
+
+    if len(parts) != 2:
+        raise ValueError("Usage: summarize <file>")
+
+    return Path(parts[1]).expanduser()
+
+
 def _find_audiotee() -> Path:
     """Find the audiotee binary."""
     if _AUDIOTEE_BIN.exists():
@@ -390,7 +424,7 @@ def _listen(args):
     print(f"Listening | buffer: {buffer_min} min | rate: {sample_rate} Hz | output: {output_dir}")
     if do_system_audio:
         print("  System audio: on (via audiotee)")
-    print('Commands: save [min] [--name "Meeting"], buffer <min>, mark [label], marks, pause, resume, status, q')
+    print('Commands: save [min] [--name "Meeting"], buffer <min>, mark [label], marks, pause, resume, status, transcribe <file> [--diarize], summarize <file>, q')
     if do_transcribe:
         flags = f"Auto-transcribe: on | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
         print(f"  {flags}")
@@ -404,6 +438,25 @@ def _listen(args):
             )
             workers.append(t)
             t.start()
+
+    def _launch_transcribe(wav_path, diarize, summarize):
+        if not wav_path.exists():
+            print(f"File not found: {wav_path}")
+            return
+        t = threading.Thread(
+            target=_transcribe_background,
+            args=(wav_path, diarize, summarize),
+        )
+        workers.append(t)
+        t.start()
+
+    def _launch_summarize(txt_path):
+        if not txt_path.exists():
+            print(f"File not found: {txt_path}")
+            return
+        t = threading.Thread(target=_summarize_background, args=(txt_path,))
+        workers.append(t)
+        t.start()
 
     with stream:
         while True:
@@ -521,6 +574,20 @@ def _listen(args):
                 print(f"Buffer: {filled_s:.1f}s / {cap_s:.0f}s ({pct:.0f}%) | mem: {alloc_mb:.0f}/{max_mb:.0f} MB | {state}")
                 if marks:
                     print(f"Marks: {len(marks)}")
+            elif command_name == "transcribe":
+                try:
+                    wav_path, diarize_arg = _parse_transcribe_command(cmd)
+                except ValueError as e:
+                    print(f"Cannot transcribe: {e}")
+                    continue
+                _launch_transcribe(wav_path, diarize_arg, False)
+            elif command_name == "summarize":
+                try:
+                    txt_path = _parse_summarize_command(cmd)
+                except ValueError as e:
+                    print(f"Cannot summarize: {e}")
+                    continue
+                _launch_summarize(txt_path)
             else:
                 print(f"Unknown: {cmd}")
 

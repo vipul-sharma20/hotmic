@@ -29,6 +29,7 @@ With optional features:
 
 ```bash
 pip install -e '.[transcribe]'   # + mlx-whisper for transcription
+pip install -e '.[vad]'          # + silero-vad for live transcription / speech detection
 pip install -e '.[diarize]'      # + transcription + speaker diarization
 pip install -e '.[all]'          # everything
 ```
@@ -73,9 +74,21 @@ When system audio capture is enabled, each save writes:
 
 ### Transcription & summarization
 
+Transcription is **on by default**, gated by [Silero VAD](https://github.com/snakers4/silero-vad):
+
+- **Live transcript**: while listening, speech is detected and segmented into
+  utterances, each transcribed as it finishes and appended to a per-session
+  `live_<timestamp>.txt` in the output directory. Silence is never sent to
+  whisper.
+- **On save**: every save is transcribed (`.txt` + `.srt`), unless VAD finds
+  no speech in it — then transcription is skipped.
+
 ```bash
-# Auto-transcribe every save (writes .txt + .srt alongside .wav)
-hotmic listen --buffer 30 --transcribe
+# Default: live VAD-gated transcription + transcribe every save
+hotmic listen --buffer 30
+
+# Disable all transcription
+hotmic listen --buffer 30 --no-transcribe
 
 # Auto-transcribe with speaker diarization
 hotmic listen --buffer 30 --diarize
@@ -93,7 +106,28 @@ hotmic transcribe recording.wav --diarize
 hotmic summarize recording.txt
 ```
 
-Transcription uses [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized). Diarization uses [diarize](https://github.com/FoxNoseTech/diarize) (no API keys needed). Summarization uses `claude -p`.
+Transcription uses [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized). Diarization runs locally via [diarize](https://github.com/FoxNoseTech/diarize), or is offloaded to a remote GPU service (see below). Summarization uses `claude -p`.
+
+### Remote diarization (offload to a GPU box)
+
+Diarization is the most compute-heavy step. Instead of running it on the Mac,
+you can offload it to a self-hosted [pyannote](https://github.com/pyannote/pyannote-audio)
+service — the **[`diarization-service`](https://github.com/vipul-sharma20/diarization-service)**
+project (a separate repo, meant for a GPU machine). Point hotmic at it:
+
+```bash
+export HOTMIC_DIARIZE_URL=https://diarize.example.com
+export HOTMIC_DIARIZE_TOKEN=<shared secret>
+hotmic listen --diarize        # diarization now runs on the remote GPU
+```
+
+When set, hotmic downsamples each save to 16 kHz mono and POSTs it to the
+service (bearer-token auth), running the request **concurrently** with local
+transcription so recording and live transcription are never blocked. If the
+service is unreachable the transcript is still written, just without speaker
+labels — there is no silent local fallback. The service, its API, and full
+deployment/security details live in the separate `diarization-service` project
+(`DEPLOY.md` there).
 
 ### Bookmarks
 
@@ -138,7 +172,7 @@ cmd + shift - r : hotmic resume
 -r --rate=<hz>      Sample rate in Hz [default: 44100]
 --system-audio      Capture system audio via audiotee (macOS 14.2+)
 --name=<name>       Meeting name to prefix the save directory
---transcribe        Transcribe saved audio using mlx-whisper
+--no-transcribe     Disable transcription (live and on save); on by default
 --diarize           Identify speakers (requires diarize package)
 --summarize         Generate meeting notes (requires claude CLI)
 ```

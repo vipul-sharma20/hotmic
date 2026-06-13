@@ -19,6 +19,8 @@ diarize = ["mlx-whisper", "diarize"]
 # silero-vad is used only for its bundled silero_vad.onnx model file;
 # the package API (and its torch dependency) is never imported at runtime.
 vad = ["silero-vad", "onnxruntime"]
+# Remote diarization (HOTMIC_DIARIZE_URL) needs no extra client deps — it uses
+# stdlib urllib + numpy. `diarize` is only for local, on-device diarization.
 all = ["mlx-whisper", "diarize", "silero-vad", "onnxruntime"]
 
 [project.scripts]

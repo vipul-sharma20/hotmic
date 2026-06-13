@@ -1,8 +1,28 @@
-"""Transcribe audio files using mlx-whisper, with optional speaker diarization."""
+"""Transcribe audio files using mlx-whisper, with optional speaker diarization.
 
+Diarization is offloaded to a remote pyannote service when
+``HOTMIC_DIARIZE_URL`` is set. The request runs concurrently with local
+MLX transcription and is merged at the end, so it never sits on the recording
+or live-transcription path. If the service is unreachable the transcript is
+still written, just without speaker labels — there is no local fallback once a
+remote backend is configured.
+"""
+
+import io
+import json
+import os
+import threading
+import urllib.request
+import wave
 from pathlib import Path
 
+import numpy as np
+
 _MODEL = "mlx-community/whisper-large-v3-turbo"
+
+_DIARIZE_URL = "HOTMIC_DIARIZE_URL"
+_DIARIZE_TOKEN = "HOTMIC_DIARIZE_TOKEN"
+_DIARIZE_TIMEOUT = float(os.environ.get("HOTMIC_DIARIZE_TIMEOUT", "600"))
 
 
 def _release_mlx_cache():
@@ -15,7 +35,6 @@ def _release_mlx_cache():
     """
     import mlx.core as mx
     mx.clear_cache()
-
 
 
 def transcribe_wav(wav_path: Path, diarize: bool = False) -> tuple[Path, Path]:
@@ -34,15 +53,30 @@ def transcribe_wav(wav_path: Path, diarize: bool = False) -> tuple[Path, Path]:
             "Install it with: pip install -e '.[transcribe]'"
         )
 
-    result = mlx_whisper.transcribe(
-        str(wav_path),
-        path_or_hf_repo=_MODEL,
-        word_timestamps=diarize,
-    )
+    # Kick off diarization (remote GPU or local lib) before transcribing, so
+    # it overlaps the local MLX work instead of running after it.
+    diar = {}
+    diar_thread = None
+    if diarize:
+        diar_thread = threading.Thread(
+            target=lambda: diar.update(segments=_diarize_segments(wav_path)),
+            daemon=True,
+        )
+        diar_thread.start()
+
+    result = mlx_whisper.transcribe(str(wav_path), path_or_hf_repo=_MODEL)
+    _release_mlx_cache()
     segments = result.get("segments", [])
 
-    if diarize:
-        segments = _assign_speakers(wav_path, segments)
+    if diar_thread is not None:
+        diar_thread.join()
+        speaker_segments = diar.get("segments")
+        if speaker_segments:
+            for seg in segments:
+                mid = (seg["start"] + seg["end"]) / 2
+                seg["speaker"] = _find_speaker(speaker_segments, mid)
+        else:
+            print("Diarization unavailable; writing transcript without speaker labels.")
 
     txt_path = wav_path.with_suffix(".txt")
     srt_path = wav_path.with_suffix(".srt")
@@ -72,30 +106,82 @@ def transcribe_audio(audio_16k) -> str:
     return result.get("text", "").strip()
 
 
+def _diarize_segments(wav_path: Path) -> list[tuple] | None:
+    """Return [(start, end, speaker), ...], or None if diarization failed.
 
-def _assign_speakers(wav_path: Path, segments: list[dict]) -> list[dict]:
-    """Run diarization and assign speaker labels to whisper segments."""
+    Uses the remote service when ``HOTMIC_DIARIZE_URL`` is set (no local
+    fallback on failure — returns None so the transcript is written unlabeled).
+    Otherwise runs the local ``diarize`` library, for offline single-file use.
+    """
+    if os.environ.get(_DIARIZE_URL):
+        return _diarize_remote(wav_path)
+    return _diarize_local(wav_path)
+
+
+def _diarize_local(wav_path: Path) -> list[tuple] | None:
     try:
         import diarize as diarize_lib
     except ImportError:
         raise SystemExit(
-            "diarize is required for speaker diarization.\n"
+            "diarize is required for local speaker diarization, or set "
+            "HOTMIC_DIARIZE_URL to use the remote service.\n"
             "Install it with: pip install -e '.[diarize]'"
         )
-
-    print("Running speaker diarization...")
+    print("Running speaker diarization (local)...")
     result = diarize_lib.diarize(str(wav_path))
+    return [(s.start, s.end, s.speaker) for s in result.segments]
 
-    # Build (start, end, speaker) list from diarize output
-    speaker_segments = [(s.start, s.end, s.speaker) for s in result.segments]
 
-    # Assign speaker to each whisper segment based on midpoint overlap
-    for seg in segments:
-        mid = (seg["start"] + seg["end"]) / 2
-        speaker = _find_speaker(speaker_segments, mid)
-        seg["speaker"] = speaker
+def _diarize_remote(wav_path: Path) -> list[tuple] | None:
+    """POST 16 kHz mono audio to the remote diarization service."""
+    url = os.environ[_DIARIZE_URL].rstrip("/") + "/diarize"
+    token = os.environ.get(_DIARIZE_TOKEN, "")
+    try:
+        audio = _wav_to_16k_mono_wav_bytes(wav_path)
+        body, content_type = _multipart_wav(audio, "audio.wav")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", content_type)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        print(f"Diarizing via {os.environ[_DIARIZE_URL]} ...")
+        with urllib.request.urlopen(req, timeout=_DIARIZE_TIMEOUT) as resp:
+            payload = json.load(resp)
+        return [(s["start"], s["end"], s["speaker"]) for s in payload["segments"]]
+    except Exception as e:  # network, auth, timeout, malformed response
+        print(f"Remote diarization failed ({e}); transcript will be unlabeled.")
+        return None
 
-    return segments
+
+def _wav_to_16k_mono_wav_bytes(wav_path: Path) -> bytes:
+    """Read a WAV and return 16 kHz mono int16 WAV bytes (small upload)."""
+    with wave.open(str(wav_path), "rb") as wf:
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1).astype(np.int16)
+    if rate != 16000:
+        n_out = int(len(audio) * 16000 / rate)
+        x = np.arange(n_out, dtype=np.float64) * (rate / 16000)
+        audio = np.interp(x, np.arange(len(audio)), audio).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(16000)
+        out.writeframes(audio.tobytes())
+    return buf.getvalue()
+
+
+def _multipart_wav(data: bytes, filename: str) -> tuple[bytes, str]:
+    boundary = "----hotmic" + os.urandom(16).hex()
+    head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    return head + data + tail, f"multipart/form-data; boundary={boundary}"
 
 
 def _find_speaker(speaker_segments: list[tuple], time_point: float) -> str:
@@ -111,17 +197,12 @@ def _find_speaker(speaker_segments: list[tuple], time_point: float) -> str:
 
 
 def _format_txt(segments: list[dict]) -> str:
-    lines = []
-    current_speaker = None
-    for seg in segments:
-        text = seg["text"].strip()
-        if not text:
-            continue
-        speaker = seg.get("speaker")
-        if speaker and speaker != current_speaker:
-            current_speaker = speaker
-            lines.append(f"\n[{speaker}]")
-        lines.append(text)
+    """Raw transcript only — no speaker labels, even when diarized.
+
+    Speaker attribution is kept in the .srt (which carries timestamps), so the
+    .txt stays a clean, readable transcript.
+    """
+    lines = [seg["text"].strip() for seg in segments if seg["text"].strip()]
     return "\n".join(lines).strip()
 
 

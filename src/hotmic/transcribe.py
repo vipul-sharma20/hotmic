@@ -5,6 +5,19 @@ from pathlib import Path
 _MODEL = "mlx-community/whisper-large-v3-turbo"
 
 
+def _release_mlx_cache():
+    """Return MLX's Metal buffer cache to the OS.
+
+    The cache grows to peak-activation size on every transcription and never
+    shrinks on its own — multi-GB over a long session for a daemon that
+    transcribes in bursts. Clearing between utterances trades a little buffer
+    reuse for a flat memory profile.
+    """
+    import mlx.core as mx
+    mx.clear_cache()
+
+
+
 def transcribe_wav(wav_path: Path, diarize: bool = False) -> tuple[Path, Path]:
     """Transcribe a WAV file, writing .txt and .srt alongside it.
 
@@ -38,6 +51,26 @@ def transcribe_wav(wav_path: Path, diarize: bool = False) -> tuple[Path, Path]:
     srt_path.write_text(_format_srt(segments))
 
     return txt_path, srt_path
+
+
+def transcribe_audio(audio_16k) -> str:
+    """Transcribe a float32 16 kHz mono array, returning plain text.
+
+    Used by live transcription, where utterances come straight from the
+    ring buffer and never touch disk.
+    """
+    try:
+        import mlx_whisper
+    except ImportError:
+        raise ImportError(
+            "mlx-whisper is required for transcription.\n"
+            "Install it with: pip install -e '.[transcribe]'"
+        )
+
+    result = mlx_whisper.transcribe(audio_16k, path_or_hf_repo=_MODEL)
+    _release_mlx_cache()
+    return result.get("text", "").strip()
+
 
 
 def _assign_speakers(wav_path: Path, segments: list[dict]) -> list[dict]:

@@ -16,7 +16,10 @@ dependencies = [
 [project.optional-dependencies]
 transcribe = ["mlx-whisper"]
 diarize = ["mlx-whisper", "diarize"]
-all = ["mlx-whisper", "diarize"]
+# silero-vad is used only for its bundled silero_vad.onnx model file;
+# the package API (and its torch dependency) is never imported at runtime.
+vad = ["silero-vad", "onnxruntime"]
+all = ["mlx-whisper", "diarize", "silero-vad", "onnxruntime"]
 
 [project.scripts]
 hotmic = "hotmic.cli:main"

@@ -1,7 +1,7 @@
 """hotmic: Continuous mic buffer with on-demand save.
 
 Usage:
-    hotmic listen [--buffer=<min>] [--output=<dir>] [--rate=<hz>] [--system-audio] [--transcribe] [--diarize] [--summarize]
+    hotmic listen [--buffer=<min>] [--output=<dir>] [--rate=<hz>] [--system-audio] [--no-transcribe] [--diarize] [--summarize]
     hotmic save [<minutes>] [--since-mark] [--between-marks] [--name=<name>]
     hotmic pause
     hotmic resume
@@ -20,9 +20,9 @@ Options:
     -r --rate=<hz>      Sample rate in Hz [default: 44100]
     --system-audio      Capture system audio (Zoom/Meet/Teams) via audiotee
     --name=<name>       Meeting name to prefix the save directory
-    --transcribe        Transcribe saved audio using mlx-whisper
+    --no-transcribe     Disable transcription (live and on save); on by default
     --diarize           Identify speakers (requires diarize package)
-    --summarize         Generate meeting notes after transcription (implies --transcribe)
+    --summarize         Generate meeting notes after transcription
     -h --help           Show this help
     --version           Show version
 """
@@ -41,6 +41,15 @@ import time
 import wave
 from datetime import datetime
 from pathlib import Path
+
+# readline's C init takes the stdin file lock. torch (pulled in by the live
+# VAD thread) imports readline transitively, which deadlocks against the
+# blocking input() in the stdin reader thread. Importing it here, while only
+# the main thread exists, makes the later import a no-op.
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass
 
 import numpy as np
 import sounddevice as sd
@@ -194,8 +203,34 @@ def _save_range(ring: RingBuffer, start_total: int, end_total: int,
     return filepath
 
 
+def _read_wav_mono(wav_path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(wav_path), "rb") as wf:
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1).astype(np.int16)
+    return audio, rate
+
+
+def _wav_has_speech(wav_path: Path) -> bool:
+    """VAD check on a saved file. Errs toward transcribing if VAD is unavailable."""
+    try:
+        from .vad import has_speech
+        audio, rate = _read_wav_mono(wav_path)
+        return has_speech(audio, rate)
+    except ImportError:
+        return True
+    except Exception as e:
+        print(f"VAD check failed ({e}), transcribing anyway.", file=sys.stderr)
+        return True
+
+
 def _transcribe_background(wav_path: Path, do_diarize: bool, do_summarize: bool):
     try:
+        if not _wav_has_speech(wav_path):
+            print(f"No speech detected in {wav_path.parent.name}/{wav_path.name}, skipping transcription.")
+            return
         from .transcribe import transcribe_wav
         print(f"Transcribing {wav_path.parent.name}/{wav_path.name}{'  (+ diarization)' if do_diarize else ''}...")
         txt_path, srt_path = transcribe_wav(wav_path, diarize=do_diarize)
@@ -214,6 +249,81 @@ def _summarize_background(txt_path: Path):
         print(f"Summary -> {txt_path.parent.name}/{summary_path.name}")
     except Exception as e:
         print(f"Summarization failed: {e}", file=sys.stderr)
+
+
+# --- Live transcription ---
+
+def _live_transcriber(ring: RingBuffer, sample_rate: int, output_dir: Path,
+                      stop: threading.Event, state: dict):
+    """Follow the ring buffer, segment speech with Silero VAD, transcribe.
+
+    Polls new audio via the monotonic total_writes cursor. Only audio that
+    VAD marks as speech is sent to whisper; silence costs nothing. Each
+    finished utterance is appended to a per-session transcript file.
+    """
+    try:
+        from .transcribe import transcribe_audio
+        from .vad import SpeechMonitor, to_float_16k
+        monitor = SpeechMonitor(sample_rate, 0)
+    except ImportError as e:
+        print(f"\nLive transcription disabled: {e}", file=sys.stderr)
+        return
+    except Exception as e:
+        print(f"\nLive transcription failed to start: {e}", file=sys.stderr)
+        return
+
+    # Audio kept flowing while the VAD model loaded; align coordinates to
+    # the ring cursor we will actually start feeding from.
+    cursor = ring.total_writes
+    monitor.rebase(cursor)
+
+    session = datetime.now().strftime("%Y%m%d_%H%M%S")
+    transcript_path = output_dir / f"live_{session}.txt"
+    transcript_path.touch()
+    state["transcript"] = transcript_path
+    print(f"Live transcript -> {transcript_path}")
+
+    def handle(start_total: int, end_total: int):
+        try:
+            audio = ring.read_range(start_total, end_total)
+        except ValueError:
+            return  # utterance already overwritten (buffer smaller than backlog)
+        if len(audio) == 0:
+            return
+        try:
+            text = transcribe_audio(to_float_16k(audio, sample_rate))
+        except Exception as e:
+            print(f"Live transcription error: {e}", file=sys.stderr)
+            return
+        if not text:
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        with open(transcript_path, "a") as f:
+            f.write(f"[{ts}] {text}\n")
+        state["utterances"] += 1
+        print(f"[live {ts}] {text}")
+
+    while not stop.wait(1.0):
+        now = ring.total_writes
+        if now == cursor:
+            continue
+        try:
+            chunk = ring.read_range(cursor, now)
+        except ValueError:
+            # Fell behind the buffer (e.g. long transcription) — restart clean.
+            monitor = SpeechMonitor(sample_rate, 0)
+            cursor = ring.total_writes
+            monitor.rebase(cursor)
+            continue
+        cursor = now
+        events = monitor.feed(chunk)
+        state["speaking"] = monitor.speaking
+        for start_total, end_total in events:
+            handle(start_total, end_total)
+
+    for start_total, end_total in monitor.flush():
+        handle(start_total, end_total)
+    state["speaking"] = False
 
 
 # --- Marks persistence ---
@@ -367,13 +477,9 @@ def _listen(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     do_system_audio = args.get("--system-audio", False)
-    do_transcribe = args.get("--transcribe", False)
+    do_transcribe = not args.get("--no-transcribe", False)
     do_diarize = args.get("--diarize", False)
     do_summarize = args.get("--summarize", False)
-    if do_summarize:
-        do_transcribe = True
-    if do_diarize:
-        do_transcribe = True
 
     _cleanup_pipe()
     os.mkfifo(_PIPE_PATH)
@@ -421,13 +527,26 @@ def _listen(args):
     threading.Thread(target=_stdin_reader, args=(q,), daemon=True).start()
     threading.Thread(target=_fifo_reader, args=(q,), daemon=True).start()
 
+    # Live VAD-gated transcription of the ring buffer
+    live_stop = threading.Event()
+    live_state = {"speaking": False, "utterances": 0, "transcript": None}
+    live_thread = None
+    if do_transcribe:
+        live_thread = threading.Thread(
+            target=_live_transcriber,
+            args=(ring, sample_rate, output_dir, live_stop, live_state),
+        )
+        live_thread.start()
+
     print(f"Listening | buffer: {buffer_min} min | rate: {sample_rate} Hz | output: {output_dir}")
     if do_system_audio:
         print("  System audio: on (via audiotee)")
     print('Commands: save [min] [--name "Meeting"], buffer <min>, mark [label], marks, pause, resume, status, transcribe <file> [--diarize], summarize <file>, q')
     if do_transcribe:
-        flags = f"Auto-transcribe: on | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
+        flags = f"Transcription: on (VAD-gated) | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
         print(f"  {flags}")
+    else:
+        print("  Transcription: off")
     print()
 
     def _launch_post_save(filepath):
@@ -572,6 +691,9 @@ def _listen(args):
                 max_mb = ring.capacity * 2 / 1_048_576
                 state = "listening" if stream.active else "paused"
                 print(f"Buffer: {filled_s:.1f}s / {cap_s:.0f}s ({pct:.0f}%) | mem: {alloc_mb:.0f}/{max_mb:.0f} MB | {state}")
+                if live_state["transcript"]:
+                    vad = "speaking" if live_state["speaking"] else "quiet"
+                    print(f"Live transcript: {live_state['transcript'].name} | VAD: {vad} | {live_state['utterances']} utterance(s)")
                 if marks:
                     print(f"Marks: {len(marks)}")
             elif command_name == "transcribe":
@@ -595,6 +717,11 @@ def _listen(args):
     if audiotee_proc:
         audiotee_proc.terminate()
         audiotee_proc.wait(timeout=5)
+
+    # Stop the live transcriber; it flushes any in-progress utterance
+    if live_thread:
+        live_stop.set()
+        live_thread.join(timeout=120)
 
     # Wait for background transcription/summarization to finish
     alive = [t for t in workers if t.is_alive()]

@@ -468,6 +468,57 @@ def _audiotee_reader(ring: RingBuffer, sample_rate: int, proc: subprocess.Popen)
         print(f"\n[system-audio] {e}", file=sys.stderr)
 
 
+def _stream_watchdog(ring, paused, stop_event, state, restart):
+    """Detect a silently-dead mic stream and restart it.
+
+    macOS can kill the AUHAL input stream out from under us on a device
+    reconfig (PaMacCore err=-50) — sounddevice stops invoking the callback
+    but never raises, so the ring buffer silently freezes. We watch the
+    monotonic ``total_writes`` counter; if it stops advancing while we are
+    meant to be capturing, we abort and reopen the stream, with backoff so a
+    genuinely-gone device (unplugged, no fallback) can't spin.
+    """
+    POLL = 2.0        # how often to check
+    STALL = 5.0       # no new samples for this long => stream is dead
+    backoff = 1.0
+    last_total = ring.total_writes
+    last_advance = time.monotonic()
+    while not stop_event.wait(POLL):
+        # Paused by the user: mic is intentionally stopped, don't monitor.
+        if paused.is_set():
+            last_total = ring.total_writes
+            last_advance = time.monotonic()
+            backoff = 1.0
+            state["stalled"] = False
+            continue
+        now = ring.total_writes
+        if now != last_total:
+            last_total = now
+            last_advance = time.monotonic()
+            backoff = 1.0
+            state["stalled"] = False
+            continue
+        if time.monotonic() - last_advance < STALL:
+            continue
+        # No audio for STALL seconds while unpaused: the stream is dead.
+        state["stalled"] = True
+        print(f"\n⚠ audio stream stalled (no samples for {STALL:.0f}s) "
+              "— restarting", file=sys.stderr)
+        if restart():
+            state["restarts"] += 1
+            state["stalled"] = False
+            last_total = ring.total_writes
+            last_advance = time.monotonic()
+            backoff = 1.0
+            print("✓ audio stream restarted", file=sys.stderr)
+        else:
+            print(f"  restart failed — retrying in {backoff:.0f}s",
+                  file=sys.stderr)
+            stop_event.wait(backoff)
+            backoff = min(backoff * 2, 30.0)
+            # keep last_advance stale so we retry on the next poll
+
+
 # --- Main listen loop ---
 
 def _listen(args):
@@ -516,12 +567,35 @@ def _listen(args):
             print(f"\n[audio] {status}", file=sys.stderr)
         ring.write(indata[:, 0])
 
-    stream = sd.InputStream(
-        samplerate=sample_rate,
-        channels=1,
-        dtype="int16",
-        callback=callback,
-    )
+    # The mic stream can die silently on a macOS device reconfig, so it is
+    # kept in a mutable holder and reopened by the watchdog on stall. All
+    # readers (command loop, watchdog) go through the holder, never a captured
+    # `stream` local, so a restart is transparent to them.
+    stream_holder = {"stream": None}
+    paused = threading.Event()
+
+    def _open_stream():
+        s = sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            callback=callback,
+        )
+        s.start()
+        return s
+
+    def _restart_stream():
+        old = stream_holder["stream"]
+        if old is not None:
+            old.abort()   # ignore_errors=True by default
+            old.close()
+        try:
+            stream_holder["stream"] = _open_stream()
+            return True
+        except Exception as e:
+            stream_holder["stream"] = None
+            print(f"\n[audio] reopen failed: {e}", file=sys.stderr)
+            return False
 
     q = queue.Queue()
     threading.Thread(target=_stdin_reader, args=(q,), daemon=True).start()
@@ -577,7 +651,18 @@ def _listen(args):
         workers.append(t)
         t.start()
 
-    with stream:
+    stream_holder["stream"] = _open_stream()
+
+    # Watchdog: restarts the mic stream if it dies silently (macOS -50).
+    wd_stop = threading.Event()
+    wd_state = {"stalled": False, "restarts": 0}
+    threading.Thread(
+        target=_stream_watchdog,
+        args=(ring, paused, wd_stop, wd_state, _restart_stream),
+        daemon=True,
+    ).start()
+
+    try:
         while True:
             cmd = q.get()
             if cmd is None:
@@ -672,14 +757,22 @@ def _listen(args):
                         name = f" '{m['label']}'" if m["label"] else ""
                         print(f"  #{i}{name} at {ts} [{valid}]")
             elif command_name == "pause":
-                if stream.active:
-                    stream.stop()
+                if not paused.is_set():
+                    paused.set()   # tell the watchdog to stand down first
+                    s = stream_holder["stream"]
+                    if s is not None:
+                        s.stop()
                     print("Paused.")
                 else:
                     print("Already paused.")
             elif command_name == "resume":
-                if not stream.active:
-                    stream.start()
+                if paused.is_set():
+                    s = stream_holder["stream"]
+                    if s is not None and not s.active:
+                        s.start()
+                    elif s is None:
+                        stream_holder["stream"] = _open_stream()
+                    paused.clear()
                     print("Resumed.")
                 else:
                     print("Already listening.")
@@ -689,7 +782,15 @@ def _listen(args):
                 pct = filled_s / cap_s * 100
                 alloc_mb = ring.allocated_bytes / 1_048_576
                 max_mb = ring.capacity * 2 / 1_048_576
-                state = "listening" if stream.active else "paused"
+                if paused.is_set():
+                    state = "paused"
+                elif wd_state["stalled"]:
+                    state = "STALLED (restarting)"
+                else:
+                    s = stream_holder["stream"]
+                    state = "listening" if (s is not None and s.active) else "stopped"
+                if wd_state["restarts"]:
+                    state += f" | restarts: {wd_state['restarts']}"
                 print(f"Buffer: {filled_s:.1f}s / {cap_s:.0f}s ({pct:.0f}%) | mem: {alloc_mb:.0f}/{max_mb:.0f} MB | {state}")
                 if live_state["transcript"]:
                     vad = "speaking" if live_state["speaking"] else "quiet"
@@ -712,6 +813,13 @@ def _listen(args):
                 _launch_summarize(txt_path)
             else:
                 print(f"Unknown: {cmd}")
+    finally:
+        # Stop the watchdog before closing the stream so it can't reopen it.
+        wd_stop.set()
+        s = stream_holder["stream"]
+        if s is not None:
+            s.stop()
+            s.close()
 
     # Stop audiotee if running
     if audiotee_proc:

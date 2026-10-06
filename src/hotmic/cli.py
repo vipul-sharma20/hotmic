@@ -532,6 +532,16 @@ def _listen(args):
     do_diarize = args.get("--diarize", False)
     do_summarize = args.get("--summarize", False)
 
+    # Fail before touching the mic if the backend is misconfigured; otherwise
+    # every utterance would fail on its own background thread.
+    backend = None
+    if do_transcribe:
+        from .transcribe import backend_label
+        try:
+            backend = backend_label()
+        except RuntimeError as e:
+            raise SystemExit(f"Cannot start transcription: {e}")
+
     _cleanup_pipe()
     os.mkfifo(_PIPE_PATH)
     atexit.register(_cleanup_pipe)
@@ -617,7 +627,7 @@ def _listen(args):
         print("  System audio: on (via audiotee)")
     print('Commands: save [min] [--name "Meeting"], buffer <min>, mark [label], marks, pause, resume, status, transcribe <file> [--diarize], summarize <file>, q')
     if do_transcribe:
-        flags = f"Transcription: on (VAD-gated) | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
+        flags = f"Transcription: on (VAD-gated, {backend}) | Diarize: {'on' if do_diarize else 'off'} | Auto-summarize: {'on' if do_summarize else 'off'}"
         print(f"  {flags}")
     else:
         print("  Transcription: off")
@@ -878,7 +888,10 @@ def main():
             sys.exit(1)
         do_diarize = args.get("--diarize", False)
         print(f"Transcribing {wav_path.name}{'  (+ diarization)' if do_diarize else ''}...")
-        txt_path, srt_path = transcribe_wav(wav_path, diarize=do_diarize)
+        try:
+            txt_path, srt_path = transcribe_wav(wav_path, diarize=do_diarize)
+        except RuntimeError as e:
+            sys.exit(f"Transcription failed: {e}")
         print(f"Done -> {txt_path}, {srt_path}")
     elif args["summarize"]:
         from .summarize import summarize_transcript

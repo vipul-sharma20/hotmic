@@ -28,7 +28,7 @@ pip install -e .
 With optional features:
 
 ```bash
-pip install -e '.[transcribe]'   # + mlx-whisper for transcription
+pip install -e '.[transcribe]'   # + mlx-whisper for transcription (not needed with the OpenRouter backend)
 pip install -e '.[vad]'          # + silero-vad for live transcription / speech detection
 pip install -e '.[diarize]'      # + transcription + speaker diarization
 pip install -e '.[all]'          # everything
@@ -106,7 +106,36 @@ hotmic transcribe recording.wav --diarize
 hotmic summarize recording.txt
 ```
 
-Transcription uses [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized). Diarization runs locally via [diarize](https://github.com/FoxNoseTech/diarize), or is offloaded to a remote GPU service (see below). Summarization uses `claude -p`.
+Transcription uses [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon optimized) by default, or hosted Whisper via OpenRouter (see below). Diarization runs locally via [diarize](https://github.com/FoxNoseTech/diarize), or is offloaded to a remote GPU service (see below). Summarization uses `claude -p`.
+
+### Hosted transcription via OpenRouter
+
+Instead of running whisper on the Mac, hotmic can send speech to
+[OpenRouter's speech-to-text endpoint](https://openrouter.ai/docs/guides/overview/multimodal/stt).
+The MLX model then never loads (~1.5 GB less RAM) and mlx-whisper is not needed.
+
+```bash
+export HOTMIC_TRANSCRIBE_BACKEND=openrouter    # default: mlx
+export OPENROUTER_API_KEY=<key>
+export HOTMIC_OPENROUTER_MODEL=openai/whisper-large-v3   # optional; default openai/whisper-large-v3-turbo
+hotmic listen
+```
+
+The backend applies to live transcription, saves, and `hotmic transcribe`.
+Having `OPENROUTER_API_KEY` set does not switch backends on its own, so audio
+leaves the machine only when you opt in. The startup banner shows the active
+backend and model, and `listen` exits early if the config is incomplete.
+
+- Audio is uploaded as 16 kHz mono WAV. Saves longer than 5 minutes are split
+  into ≤5 min chunks, cut at the quietest point near each limit, to stay under
+  OpenRouter's 25 MB upload cap and 60 s provider timeout.
+- Rate limits (429) and provider errors (5xx) are retried up to 3 times,
+  honoring `retry-after`.
+- Live transcription sends one request per utterance.
+- OpenRouter picks the provider for transcription requests and ignores
+  `provider.order`/`only`. `openai/whisper-large-v3-turbo` is served by
+  DeepInfra and Groq. To route to Groq, add your Groq API key as a
+  *prioritized* BYOK key in OpenRouter's integration settings.
 
 ### Remote diarization (offload to a GPU box)
 
